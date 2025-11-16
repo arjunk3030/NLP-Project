@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch import Tensor, nn
 
-from assignment4.utils import PositionalEncoding, ResidualBlock, build_causal_mask, build_padding_mask
+from utils import PositionalEncoding, ResidualBlock, build_causal_mask, build_padding_mask
 
 
 class CausalSelfAttentionBlock(nn.Module):
@@ -27,6 +27,7 @@ class CausalSelfAttentionBlock(nn.Module):
             Tensor `(batch, seq_len, embed_dim)` after causal attention.
         """
         return self.block.forward(hidden_states, attention_mask)
+    # TODO: check this
 
 @dataclass
 class DecoderConfig:
@@ -37,7 +38,7 @@ class DecoderConfig:
     num_heads: int = 4
     ff_dim: int = 256
     num_layers: int = 4
-    max_seq_len: int = 64
+    max_seq_len: int = 512 #TODO: use to be 64 btw
     dropout: float = 0.1
     pad_token_id: int = 0
     bos_token_id: int = 1
@@ -75,11 +76,15 @@ class MiniDecoder(nn.Module):
         tok_output = self.token_embed(input_ids)
         pos_output = self.pos_encoding(tok_output)
         drop_output = self.dropout(pos_output)
+
+        # causal = build_causal_mask(drop_output.size(1), drop_output.device)
+        # padding = build_padding_mask(attention_mask)
+
         temp = drop_output
         for layer in self.layers:
-            temp = layer(temp, attention_mask)
-        lay_norm_output = self.layer_norm(temp)
-        return self.lm_head(lay_norm_output)
+            temp = layer(temp, attention_mask=attention_mask)
+        return self.layer_norm(temp)
+    
 
     def logits(self, input_ids: Tensor, attention_mask: Tensor) -> Tensor:
         """Convenience helper returning vocabulary logits.
@@ -91,7 +96,8 @@ class MiniDecoder(nn.Module):
         Returns:
             Logits `(batch, seq_len, vocab_size)`.
         """
-        return self.forward(input_ids, attention_mask)
+        forward_result = self.forward(input_ids, attention_mask)
+        return self.lm_head(forward_result)
 
     def forward_train(
         self,
@@ -109,17 +115,22 @@ class MiniDecoder(nn.Module):
         Returns:
             Dictionary containing at least keys `loss`, `logits`, `accuracy`.
         """
-        output = {}
-        if not labels:
-            return output
-        
+        if attention_mask is None:
+            attention_mask = (input_ids != self.config.pad_token_id).long()
+            
+        output = {
+            "loss": None,
+            "logits": None,
+            "accuracy": None,
+        }
         output['logits'] = self.logits(input_ids, attention_mask)
-
-        criterion = torch.nn.CrossEntropyLoss()
-        preds = output['logits'].argmax(dim=-1)
-        output['loss'] = criterion(preds, labels)
-
-        output['accuracy'] = (preds == labels).sum() / labels.size()
+        if labels is not None:
+            criterion = torch.nn.CrossEntropyLoss(ignore_index=self.config.pad_token_id)
+            output['loss'] = criterion(output['logits'].view(-1, output['logits'].size(-1)), labels.view(-1))
+            
+            preds = output['logits'].argmax(dim=-1)
+            output['accuracy'] = ((preds == labels) & (labels != self.config.pad_token_id)).sum().float() / ((labels != self.config.pad_token_id)).sum()
+            
         return output
 
     @torch.no_grad()
