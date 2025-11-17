@@ -26,7 +26,19 @@ class CausalSelfAttentionBlock(nn.Module):
         Returns:
             Tensor `(batch, seq_len, embed_dim)` after causal attention.
         """
-        return self.block.forward(hidden_states, attention_mask)
+        
+        B, T = attention_mask.shape
+
+        # 1. padding: True where pad
+        padding_mask = build_padding_mask(attention_mask)   # (B, T)
+
+        # 2. causal: -inf above diagonal
+        causal = build_causal_mask(T, hidden_states.device)      # (T, T)
+
+        # expand causal to (1, T, T)
+        causal = causal.unsqueeze(0)   
+        
+        return self.block.forward(hidden_states, attn_mask=causal, key_padding_mask=padding_mask)
     # TODO: check this
 
 @dataclass
@@ -38,7 +50,7 @@ class DecoderConfig:
     num_heads: int = 4
     ff_dim: int = 256
     num_layers: int = 4
-    max_seq_len: int = 512 #TODO: use to be 64 btw
+    max_seq_len: int = 2048 #TODO: use to be 64 btw
     dropout: float = 0.1
     pad_token_id: int = 0
     bos_token_id: int = 1
