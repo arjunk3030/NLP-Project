@@ -74,7 +74,8 @@ def train(args):
         args: Parsed CLI arguments.
     """
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
-    hf_ds = load_dataset("roneneldan/TinyStories")["train"]
+    hf_ds = load_dataset("roneneldan/TinyStories", split="train[:8]")
+    print("the length of dataset is:", len(hf_ds))
     sequences = [row["text"] for row in hf_ds]
     tokenizer = SimpleTokenizer(sequences)
     dataset = PatternDataset(sequences, tokenizer)
