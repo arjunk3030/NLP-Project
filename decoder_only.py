@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch import Tensor, nn
 
-from utils import PositionalEncoding, ResidualBlock, build_causal_mask, build_padding_mask
+from utils import PositionalEncoding, ResidualBlock, RotaryEmbedding, build_causal_mask, build_padding_mask
 
 
 class CausalSelfAttentionBlock(nn.Module):
@@ -16,7 +16,7 @@ class CausalSelfAttentionBlock(nn.Module):
         super().__init__()
         self.block = ResidualBlock(embed_dim, num_heads, ff_dim, dropout)
 
-    def forward(self, hidden_states: Tensor, attention_mask: Tensor) -> Tensor:
+    def forward(self, hidden_states: Tensor, attention_mask: Tensor, rotary_freqs=None) -> Tensor:
         """Apply left-to-right self-attention.
 
         Args:
@@ -38,7 +38,7 @@ class CausalSelfAttentionBlock(nn.Module):
         # expand causal to (1, T, T)
         causal = causal.unsqueeze(0)   
         
-        return self.block.forward(hidden_states, attn_mask=causal, key_padding_mask=padding_mask)
+        return self.block.forward(hidden_states, attn_mask=causal, key_padding_mask=padding_mask, rotary_freqs=rotary_freqs)
     # TODO: check this
 
 @dataclass
@@ -55,6 +55,8 @@ class DecoderConfig:
     pad_token_id: int = 0
     bos_token_id: int = 1
     eos_token_id: int = 2
+    use_rope: bool = False
+    use_learned_pos: bool = False
 
 
 class MiniDecoder(nn.Module):
@@ -75,6 +77,20 @@ class MiniDecoder(nn.Module):
         self.layer_norm = nn.LayerNorm(config.embed_dim)
         self.lm_head = nn.Linear(config.embed_dim, config.vocab_size, bias=False)
 
+        self.use_rope = config.use_rope
+        self.use_learned_pos = config.use_learned_pos
+        if self.use_rope:
+            head_dim = config.embed_dim // config.num_heads
+            self.rope = RotaryEmbedding(head_dim, config.max_seq_len)
+            self.pos_encoding = None # Disable standard pos encoding
+        elif self.use_learned_pos:
+            # Learned: A trainable lookup table for positions 0..max_len
+            self.pos_embedding = nn.Embedding(config.max_seq_len, config.embed_dim)
+            self.pos_encoding = None
+            self.rope = None
+        else:
+            self.pos_encoding = PositionalEncoding(config.embed_dim, config.max_seq_len)
+
     def forward(self, input_ids: Tensor, attention_mask: Tensor) -> Tensor:
         """Compute hidden states for a batch of prefix sequences.
 
@@ -86,15 +102,37 @@ class MiniDecoder(nn.Module):
             Tensor `(batch, seq_len, embed_dim)` of decoder hidden states.
         """
         tok_output = self.token_embed(input_ids)
-        pos_output = self.pos_encoding(tok_output)
-        drop_output = self.dropout(pos_output)
+
+        rotary_freqs = None
+
+        if self.use_rope:
+            drop_output = self.dropout(tok_output)
+            
+            # Get rotary freqs
+            seq_len = input_ids.shape[1]
+            cos, sin = self.rope(tok_output, seq_len)
+            rotary_freqs = (cos, sin)
+        elif self.use_learned_pos:
+            # Learned Mode: Add a vector for Position 0, Position 1, etc.
+            seq_len = input_ids.size(1)
+            # Create indices [0, 1, 2, ... seq_len-1] on the correct device
+            positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
+            
+            # Lookup the learned vector and add it
+            pos_embeds = self.pos_embedding(positions)
+            drop_output = self.dropout(tok_output + pos_embeds)
+        else:
+            # Sinusoidal way
+            pos_output = self.pos_encoding(tok_output)
+            drop_output = self.dropout(pos_output)
+            rotary_freqs = None
 
         # causal = build_causal_mask(drop_output.size(1), drop_output.device)
         # padding = build_padding_mask(attention_mask)
 
         temp = drop_output
         for layer in self.layers:
-            temp = layer(temp, attention_mask=attention_mask)
+            temp = layer(temp, attention_mask=attention_mask, rotary_freqs=rotary_freqs)
         return self.layer_norm(temp)
     
 
@@ -137,12 +175,17 @@ class MiniDecoder(nn.Module):
         }
         output['logits'] = self.logits(input_ids, attention_mask)
         if labels is not None:
+            shift_logits = output['logits'][..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+
             criterion = torch.nn.CrossEntropyLoss(ignore_index=self.config.pad_token_id)
-            output['loss'] = criterion(output['logits'].view(-1, output['logits'].size(-1)), labels.view(-1))
-            
-            preds = output['logits'].argmax(dim=-1)
-            output['accuracy'] = ((preds == labels) & (labels != self.config.pad_token_id)).sum().float() / ((labels != self.config.pad_token_id)).sum()
-            
+
+            output['loss'] = criterion(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+            preds = shift_logits.argmax(dim=-1)
+            valid_mask = (shift_labels != self.config.pad_token_id)
+            output['accuracy'] = ((preds == shift_labels) & valid_mask).sum().float() / valid_mask.sum()
+
         return output
 
     @torch.no_grad()

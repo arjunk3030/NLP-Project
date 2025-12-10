@@ -33,6 +33,148 @@ def set_seed(seed: int = 42) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+class BPETokenizer:
+    """Byte Pair Encoding (BPE) tokenizer implemented from scratch."""
+
+    def __init__(self, vocab_size: int = 4096):
+        """
+        Args:
+            vocab_size: Target vocabulary size. 
+                        4096 is good for 'Mini' models (Wikidata).
+                        GPT-4 uses ~100k.
+        """
+        self.vocab_size = vocab_size
+        self.merges = {}  # (int, int) -> int
+        self.vocab = {}   # int -> bytes
+        self.special_tokens = {
+            "<pad>": 0,
+            "<bos>": 1,
+            "<eos>": 2,
+        }
+        # Reverse map for decoding
+        self.special_ids = {v: k for k, v in self.special_tokens.items()}
+        
+        # Base vocabulary (0-255 are raw bytes)
+        # We start our learned tokens after the special tokens and raw bytes
+        self.idx_offset = 256 + len(self.special_tokens)
+
+    def train(self, texts: List[str]):
+        """Train the tokenizer on a list of strings."""
+        print(f"Training BPE Tokenizer on {len(texts)} texts...")
+        
+        # 1. Convert all text to a massive list of integers (utf-8 bytes)
+        # In a real large-scale scenario, you'd sample the data, not use all of it.
+        raw_bytes = "".join(texts).encode("utf-8")
+        ids = list(raw_bytes)
+        
+        # 2. Iteratively merge the most common pairs
+        num_merges = self.vocab_size - 256 - len(self.special_tokens)
+        
+        for i in range(num_merges):
+            stats = self._get_stats(ids)
+            if not stats:
+                break
+                
+            # Find the most frequent pair
+            pair = max(stats, key=stats.get)
+            
+            # Mint a new token ID
+            idx = self.idx_offset + i
+            
+            # Record the merge
+            self.merges[pair] = idx
+            
+            # Apply merge to the training data (so next iteration sees the new token)
+            ids = self._merge_ids(ids, pair, idx)
+            
+            if (i + 1) % 100 == 0:
+                print(f"BPE Merge {i+1}/{num_merges}: {pair} -> {idx}")
+
+        print("Tokenizer training complete.")
+
+    def encode(self, text: str, add_special_tokens: bool = True) -> List[int]:
+        """Encode text into token IDs."""
+        # 1. Start with raw bytes
+        ids = list(text.encode("utf-8"))
+        
+        # 2. Apply merges in the order they were learned
+        while len(ids) >= 2:
+            stats = self._get_stats(ids)
+            # Find the pair in ids that has the lowest merge index (was learned earliest)
+            # Use 'inf' if the pair isn't in our merge rules
+            pair = min(stats, key=lambda p: self.merges.get(p, float("inf")))
+            
+            if pair not in self.merges:
+                break # No more mergeable pairs
+            
+            idx = self.merges[pair]
+            ids = self._merge_ids(ids, pair, idx)
+        
+        if add_special_tokens:
+            ids = [self.special_tokens["<bos>"]] + ids + [self.special_tokens["<eos>"]]
+        return ids
+
+    def decode(self, ids: List[int], skip_special_tokens: bool = True) -> str:
+        """Decode token IDs back to text using recursive reconstruction."""
+        # 1. Invert the merges to look up children: idx -> (p0, p1)
+        vocab_map = {idx: pair for pair, idx in self.merges.items()}
+        
+        def decode_token(idx):
+            # Base case: raw byte
+            if idx < 256:
+                return bytes([idx])
+            # Special tokens
+            if idx in self.special_ids:
+                return b"" if skip_special_tokens else self.special_ids[idx].encode("utf-8")
+            # Recursive case: BPE token
+            if idx in vocab_map:
+                p0, p1 = vocab_map[idx]
+                return decode_token(p0) + decode_token(p1)
+            # Fallback (shouldn't happen if trained correctly)
+            return b"?"
+
+        res = b""
+        for idx in ids:
+            res += decode_token(idx)
+        
+        return res.decode("utf-8", errors="replace")
+
+    # --- Helpers ---
+    def _get_stats(self, ids):
+        """Count frequency of adjacent pairs."""
+        counts = {}
+        for pair in zip(ids, ids[1:]):
+            counts[pair] = counts.get(pair, 0) + 1
+        return counts
+
+    def _merge_ids(self, ids, pair, idx):
+        """Replace all occurrences of `pair` with `idx`."""
+        newids = []
+        i = 0
+        while i < len(ids):
+            if i < len(ids) - 1 and ids[i] == pair[0] and ids[i+1] == pair[1]:
+                newids.append(idx)
+                i += 2
+            else:
+                newids.append(ids[i])
+                i += 1
+        return newids
+
+    @property
+    def pad_token_id(self): return self.special_tokens["<pad>"]
+    
+    @property
+    def bos_token_id(self): return self.special_tokens["<bos>"]
+
+    @property
+    def eos_token_id(self): return self.special_tokens["<eos>"]
+    
+    def pad(self, sequences, max_length=None):
+        # ... copy your existing pad logic here ...
+        # reuse the pad_sequences helper you already have in utils.py
+        from utils import pad_sequences 
+        pad_id = self.pad_token_id
+        return pad_sequences(sequences, pad_value=pad_id, max_length=max_length)
 
 class SimpleTokenizer:
     """Whitespace tokenizer with a fixed vocabulary and special tokens."""
@@ -269,6 +411,7 @@ class MultiHeadAttention(nn.Module):
         value: Tensor,
         attn_mask: Optional[Tensor] = None,
         key_padding_mask: Optional[Tensor] = None,
+        rotary_freqs=None
     ) -> Tensor:
         """Perform attention computation.
 
@@ -291,6 +434,11 @@ class MultiHeadAttention(nn.Module):
 
         q = q.view(batch_size, query_len, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(batch_size, key_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        if rotary_freqs is not None:
+            cos, sin = rotary_freqs
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
         v = v.view(batch_size, key_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
@@ -331,6 +479,7 @@ class ResidualBlock(nn.Module):
         attn_mask: Optional[Tensor] = None,
         key_padding_mask: Optional[Tensor] = None,
         kv: Optional[Tensor] = None,
+        rotary_freqs=None
     ) -> Tensor:
         """Apply attention, residual connection, and feed-forward network.
 
@@ -345,7 +494,7 @@ class ResidualBlock(nn.Module):
         """
         # Use provided key/value tensor for cross-attention, default to self-attn.
         key_value = x if kv is None else kv
-        attn_out = self.self_attn(x, key_value, key_value, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
+        attn_out = self.self_attn(x, key_value, key_value, attn_mask=attn_mask, key_padding_mask=key_padding_mask, rotary_freqs=rotary_freqs)
         x = self.norm1(x + self.dropout(attn_out))
         ff_out = self.ff(x)
         x = self.norm2(x + self.dropout(ff_out))
@@ -373,3 +522,35 @@ class Batch:
     attention_mask: Tensor
     labels: Optional[Tensor] = None
     aux: Optional[Dict[str, Tensor]] = None
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_seq_len=2048):
+        super().__init__()
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        t = torch.arange(max_seq_len, dtype=torch.float)
+        freqs = torch.outer(t, inv_freq)
+        # We need cosine and sine of these frequencies
+        # Shape: (max_seq_len, dim/2)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
+        self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
+
+    def forward(self, x, seq_len=None):
+        # x shape: (batch, num_heads, seq_len, head_dim)
+        if seq_len > self.cos_cached.shape[2]:
+            raise ValueError("Sequence length exceeds precomputed RoPE limit")
+        return (
+            self.cos_cached[:, :, :seq_len, ...],
+            self.sin_cached[:, :, :seq_len, ...]
+        )
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    # q, k shape: (batch, num_heads, seq_len, head_dim)
+    # This function rotates the vectors
+    def rotate_half(x):
+        x1, x2 = x.chunk(2, dim=-1)
+        return torch.cat((-x2, x1), dim=-1)
+
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed

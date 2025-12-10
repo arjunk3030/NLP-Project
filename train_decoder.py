@@ -7,9 +7,12 @@ from datasets import load_dataset
 import torch
 from torch.utils.data import DataLoader, Dataset
 import resource
+import wandb
+import math
+import time
 
 from decoder_only import DecoderConfig, MiniDecoder, build_few_shot_prompt
-from utils import SimpleTokenizer, set_seed
+from utils import SimpleTokenizer, set_seed, BPETokenizer
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_PATH = PACKAGE_DIR / "data" / "pattern_sequences.txt"
@@ -19,7 +22,7 @@ DEFAULT_OUTPUT_DIR = PACKAGE_DIR / "checkpoints"
 class PatternDataset(Dataset):
     """Dataset made from repeating pattern sequences."""
 
-    def __init__(self, sequences: List[str], tokenizer: SimpleTokenizer):
+    def __init__(self, sequences: List[str], tokenizer: BPETokenizer):
         """Store tokenized pattern sequences."""
         self.sequences = [seq for seq in sequences if seq.strip()]
         self.tokenizer = tokenizer
@@ -34,7 +37,7 @@ class PatternDataset(Dataset):
         return {"input_ids": tokens}
 
 
-def collate_fn(batch, tokenizer: SimpleTokenizer):
+def collate_fn(batch, tokenizer: BPETokenizer, max_length=None):
     """Pad sequences for training.
 
     Args:
@@ -45,7 +48,7 @@ def collate_fn(batch, tokenizer: SimpleTokenizer):
         Dictionary containing padded ids, attention mask, and labels.
     """
     input_ids = [item["input_ids"] for item in batch]
-    padded, attention = tokenizer.pad(input_ids)
+    padded, attention = tokenizer.pad(input_ids, max_length=max_length)
     return {
         "input_ids": padded,
         "attention_mask": attention,
@@ -73,13 +76,29 @@ def train(args):
     Args:
         args: Parsed CLI arguments.
     """
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
-    hf_ds = load_dataset("roneneldan/TinyStories", split="train[:8]")
+    wandb.init(
+        project="mini-transformer-research", 
+        config=vars(args),
+        name=f"run_rope_{args.use_rope}_lr_{args.lr}" # Optional: Naming helps you find runs
+    )
+
+    if torch.cuda.is_available() and not args.cpu:
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available() and not args.cpu:
+        device = torch.device("mps") # <--- USE MAC GPU
+        print("Using MPS (Mac GPU) acceleration")
+    else:
+        device = torch.device("cpu")
+        print("Using CPU (Warning: Slow)")
+
+    hf_ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train[:1000]")
     print("the length of dataset is:", len(hf_ds))
-    sequences = [row["text"] for row in hf_ds]
-    tokenizer = SimpleTokenizer(sequences)
+    sequences = [row["text"] for row in hf_ds if row["text"].strip()]
+    tokenizer = BPETokenizer(vocab_size=2048)
+    tokenizer.train(sequences)
+    print(f"Vocab size: {tokenizer.idx_offset + len(tokenizer.merges)}")
     dataset = PatternDataset(sequences, tokenizer)
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=lambda b: collate_fn(b, tokenizer))
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=lambda b: collate_fn(b, tokenizer, max_length=args.max_seq_len))
 
     config = DecoderConfig(
         vocab_size=tokenizer.vocab_size,
@@ -89,19 +108,30 @@ def train(args):
         num_layers=args.num_layers,
         dropout=args.dropout,
         max_seq_len=args.max_seq_len,
-        pad_token_id=tokenizer.token_id(tokenizer.pad_token),
-        bos_token_id=tokenizer.token_id(tokenizer.bos_token),
-        eos_token_id=tokenizer.token_id(tokenizer.eos_token),
+        pad_token_id=tokenizer.pad_token_id,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        use_rope=args.use_rope,
+        use_learned_pos=args.use_learned_pos
     )
 
     model = MiniDecoder(config).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model Size: {num_params/1e6:.2f} Million Parameters")
+    
+    wandb.config.update({"num_params": num_params})
+    total_start_time = time.time()
 
     for epoch in range(1, args.epochs + 1):
         model.train()
         epoch_loss = 0.0
         epoch_acc = 0.0
         steps = 0
+
+        t0 = time.time()
+
         for batch in loader:
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
@@ -109,17 +139,53 @@ def train(args):
 
             outputs = model.forward_train(input_ids, attention_mask=attention_mask, labels=labels)
             loss = outputs["loss"]
-
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_norm)
             optimizer.step()
 
+            if device.type == "mps":
+                torch.mps.synchronize()
+            elif device.type == "cuda":
+                torch.cuda.synchronize()
+
+            t1 = time.time()
+            dt = t1 - t0
+            t0 = t1
+
+            tokens_processed = input_ids.numel() 
+            tokens_per_sec = tokens_processed / dt
+
             epoch_loss += float(loss.item())
+
+            if steps % 10 == 0:
+                log_data = {
+                    "train_loss": loss.item(),
+                    "train_acc": outputs["accuracy"].item(),
+                    "learning_rate": optimizer.param_groups[0]['lr'],
+                    "train_perplexity": math.exp(loss.item()),
+                    "epoch": epoch,
+                    "iter_time_ms": dt * 1000,      # Latency
+                    "tokens_per_sec": tokens_per_sec, # Efficiency
+                    "total_time_min": (time.time() - total_start_time) / 60,
+                }
+                if device.type == "mps":
+                    # Current memory allocated in MB
+                    mem = torch.mps.current_allocated_memory() / 1e6 
+                    log_data["mps_memory_mb"] = mem
+
+                wandb.log(log_data)
+
             epoch_acc += float(outputs["accuracy"].item())
             steps += 1
+
         avg_loss = epoch_loss / max(1, steps)
         avg_acc = epoch_acc / max(1, steps)
+        wandb.log({
+            "val_loss": avg_loss, 
+            "val_perplexity": math.exp(avg_loss),
+            "val_acc": avg_acc
+        })
         print(f"Epoch {epoch:02d} - loss: {avg_loss:.4f} - token_acc: {avg_acc:.4f}")
 
     prompt = build_few_shot_prompt(
@@ -130,6 +196,11 @@ def train(args):
         query="red blue red blue",
     )
     tokens = tokenizer.encode(prompt, add_special_tokens=True)
+    max_input_len = args.max_seq_len - 5
+    if len(tokens) > max_input_len:
+        print(f"Warning: Truncating prompt from {len(tokens)} to {max_input_len} tokens.")
+        # Keep the END of the prompt (where the query is)
+        tokens = tokens[-max_input_len:]
     generated = model.generate(torch.tensor([tokens], device=device), max_new_tokens=5)
     prediction = tokenizer.decode(generated[0].tolist())
     print("Few-shot prompt:\n", prompt)
@@ -139,10 +210,11 @@ def train(args):
     torch.save(
         {
             "model_state": model.state_dict(),
-            "tokenizer_vocab": tokenizer.token_to_id,
+            "tokenizer_merges": tokenizer.merges,
         },
         Path(args.output_dir) / "decoder.pt",
     )
+    wandb.finish()
 
 
 def parse_args():
@@ -155,18 +227,20 @@ def parse_args():
     parser.add_argument("--data-path", type=Path, default=DEFAULT_DATA_PATH)
     parser.add_argument("--output-dir", type=str, default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--embed-dim", type=int, default=128)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--ff-dim", type=int, default=256)
     parser.add_argument("--num-layers", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--max-seq-len", type=int, default=2048) # TODO: used to be 64 btw
+    parser.add_argument("--max-seq-len", type=int, default=128) # TODO: used to be 64 btw
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--clip-norm", type=float, default=1.0)
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--prompt-query", type=str, default="red blue red blue")
+    parser.add_argument("--use_rope", action="store_true", help="Use Rotary Positional Embeddings")
+    parser.add_argument("--use-learned-pos", action="store_true", help="Use Learned Positional Embeddings")
     return parser.parse_args()
 
 
