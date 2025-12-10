@@ -79,13 +79,13 @@ def train(args):
     wandb.init(
         project="mini-transformer-research", 
         config=vars(args),
-        name=f"run_rope_{args.use_rope}_lr_{args.lr}" # Optional: Naming helps you find runs
+        name=f"run_rope_{args.use_rope}_lr_{args.lr}"
     )
 
     if torch.cuda.is_available() and not args.cpu:
         device = torch.device("cuda")
     elif torch.backends.mps.is_available() and not args.cpu:
-        device = torch.device("mps") # <--- USE MAC GPU
+        device = torch.device("mps")
         print("Using MPS (Mac GPU) acceleration")
     else:
         device = torch.device("cpu")
