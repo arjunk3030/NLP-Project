@@ -91,14 +91,24 @@ def train(args):
         device = torch.device("cpu")
         print("Using CPU (Warning: Slow)")
 
-    hf_ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train[:1000]")
-    print("the length of dataset is:", len(hf_ds))
-    sequences = [row["text"] for row in hf_ds if row["text"].strip()]
+    train_hf = load_dataset("wikitext", "wikitext-2-raw-v1", split="train[:1000]")
+    train_seqs = [row["text"] for row in train_hf if row["text"].strip()]
+
+    val_hf = load_dataset("wikitext", "wikitext-2-raw-v1", split="validation[:200]")
+    val_seqs = [row["text"] for row in val_hf if row["text"].strip()]
+
     tokenizer = BPETokenizer(vocab_size=2048)
-    tokenizer.train(sequences)
+    tokenizer.train(train_seqs)
+
+    train_ds = PatternDataset(train_seqs, tokenizer)
+    val_ds = PatternDataset(val_seqs, tokenizer)
+
+    print("the length of training dataset is:", len(train_hf))
+    print("the length of validation dataset is:", len(val_hf))
     print(f"Vocab size: {tokenizer.idx_offset + len(tokenizer.merges)}")
-    dataset = PatternDataset(sequences, tokenizer)
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=lambda b: collate_fn(b, tokenizer, max_length=args.max_seq_len))
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=lambda b: collate_fn(b, tokenizer, max_length=args.max_seq_len))
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=lambda b: collate_fn(b, tokenizer, max_length=args.max_seq_len))
 
     config = DecoderConfig(
         vocab_size=tokenizer.vocab_size,
@@ -132,7 +142,7 @@ def train(args):
 
         t0 = time.time()
 
-        for batch in loader:
+        for batch in train_loader:
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
@@ -179,19 +189,42 @@ def train(args):
             epoch_acc += float(outputs["accuracy"].item())
             steps += 1
 
-        avg_loss = epoch_loss / max(1, steps)
-        avg_acc = epoch_acc / max(1, steps)
+        model.eval()
+        val_loss = 0.0
+        val_acc = 0.0
+        val_steps = 0
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                labels = batch["labels"].to(device)
+                
+                outputs = model.forward_train(input_ids, attention_mask=attention_mask, labels=labels)
+                
+                val_loss += float(outputs["loss"].item())
+                val_acc += float(outputs["accuracy"].item())
+                val_steps += 1
+        
+        model.train()
+        
+        avg_val_loss = val_loss / max(1, val_steps)
+        avg_val_acc = val_acc / max(1, val_steps)
+        avg_val_ppl = math.exp(avg_val_loss)
+
+
         wandb.log({
-            "val_loss": avg_loss, 
-            "val_perplexity": math.exp(avg_loss),
-            "val_acc": avg_acc
+            "val_loss": avg_val_loss, 
+            "val_perplexity": avg_val_ppl,
+            "val_acc": avg_val_acc,
+            "epoch": epoch
         })
-        print(f"Epoch {epoch:02d} - loss: {avg_loss:.4f} - token_acc: {avg_acc:.4f}")
+        print(f"Epoch {epoch:02d} - val loss: {avg_val_loss:.4f} - val_token_acc: {avg_val_acc:.4f}")
 
     prompt = build_few_shot_prompt(
         examples=[
-            {"input": sequences[0], "output": sequences[0].split()[-1]},
-            {"input": sequences[1], "output": sequences[1].split()[-1]},
+            {"input": train_seqs[0], "output": train_seqs[0].split()[-1]},
+            {"input": train_seqs[1], "output": train_seqs[1].split()[-1]},
         ],
         query="red blue red blue",
     )
@@ -240,7 +273,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--prompt-query", type=str, default="red blue red blue")
     parser.add_argument("--use_rope", action="store_true", help="Use Rotary Positional Embeddings")
-    parser.add_argument("--use-learned-pos", action="store_true", help="Use Learned Positional Embeddings")
+    parser.add_argument("--use_learned_pos", action="store_true", help="Use Learned Positional Embeddings")
     return parser.parse_args()
 
 
