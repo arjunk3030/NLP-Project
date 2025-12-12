@@ -49,7 +49,7 @@ python train_decoder.py --use-learned-pos --output-dir checkpoints/medium_learne
 
 ## Part 2: Pretrained Model Fine-Tuning
 
-For part 2, we fine-tuned a pretrained DistilBERT model and also ran our medium mini decoder for comparison. This is done via a notebook file.
+For part 2, we fine-tuned a pretrained DistilBERT model and also ran our medium mini decoder for comparison. This is done via the notebook file SentimentAnalysis.ipynb.
 
 Before running the notebook, make sure to install the required packages, log into HuggingFace, and wandb:
 
