@@ -1,5 +1,7 @@
 ## How to Run
 
+Access this code on GitHub: https://github.com/arjunk3030/NLP-Project
+
 ### 1. Install Dependencies
 First, install all required Python packages using the provided `requirements.txt`:
 
