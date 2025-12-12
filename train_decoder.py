@@ -232,7 +232,6 @@ def train(args):
     max_input_len = args.max_seq_len - 5
     if len(tokens) > max_input_len:
         print(f"Warning: Truncating prompt from {len(tokens)} to {max_input_len} tokens.")
-        # Keep the END of the prompt (where the query is)
         tokens = tokens[-max_input_len:]
     generated = model.generate(torch.tensor([tokens], device=device), max_new_tokens=5)
     prediction = tokenizer.decode(generated[0].tolist())
@@ -278,8 +277,6 @@ def parse_args():
 
 
 if __name__ == "__main__":
-    # MAX_MEMORY = 1024 * 1024 * 1024 * 14
-    # resource.setrlimit(resource.RLIMIT_AS, (MAX_MEMORY, MAX_MEMORY))
     args = parse_args()
     set_seed(args.seed)
     train(args)

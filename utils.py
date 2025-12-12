@@ -55,19 +55,15 @@ class BPETokenizer:
         self.special_ids = {v: k for k, v in self.special_tokens.items()}
         
         # Base vocabulary (0-255 are raw bytes)
-        # We start our learned tokens after the special tokens and raw bytes
         self.idx_offset = 256 + len(self.special_tokens)
 
     def train(self, texts: List[str]):
         """Train the tokenizer on a list of strings."""
         print(f"Training BPE Tokenizer on {len(texts)} texts...")
         
-        # 1. Convert all text to a massive list of integers (utf-8 bytes)
-        # In a real large-scale scenario, you'd sample the data, not use all of it.
         raw_bytes = "".join(texts).encode("utf-8")
         ids = list(raw_bytes)
         
-        # 2. Iteratively merge the most common pairs
         num_merges = self.vocab_size - 256 - len(self.special_tokens)
         
         for i in range(num_merges):
@@ -94,10 +90,8 @@ class BPETokenizer:
 
     def encode(self, text: str, add_special_tokens: bool = True) -> List[int]:
         """Encode text into token IDs."""
-        # 1. Start with raw bytes
         ids = list(text.encode("utf-8"))
         
-        # 2. Apply merges in the order they were learned
         while len(ids) >= 2:
             stats = self._get_stats(ids)
             # Find the pair in ids that has the lowest merge index (was learned earliest)
@@ -116,7 +110,6 @@ class BPETokenizer:
 
     def decode(self, ids: List[int], skip_special_tokens: bool = True) -> str:
         """Decode token IDs back to text using recursive reconstruction."""
-        # 1. Invert the merges to look up children: idx -> (p0, p1)
         vocab_map = {idx: pair for pair, idx in self.merges.items()}
         
         def decode_token(idx):
@@ -139,7 +132,6 @@ class BPETokenizer:
         
         return res.decode("utf-8", errors="replace")
 
-    # --- Helpers ---
     def _get_stats(self, ids):
         """Count frequency of adjacent pairs."""
         counts = {}

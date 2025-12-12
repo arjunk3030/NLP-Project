@@ -39,7 +39,6 @@ class CausalSelfAttentionBlock(nn.Module):
         causal = causal.unsqueeze(0)   
         
         return self.block.forward(hidden_states, attn_mask=causal, key_padding_mask=padding_mask, rotary_freqs=rotary_freqs)
-    # TODO: check this
 
 @dataclass
 class DecoderConfig:
@@ -50,7 +49,7 @@ class DecoderConfig:
     num_heads: int = 4
     ff_dim: int = 256
     num_layers: int = 4
-    max_seq_len: int = 2048 #TODO: use to be 64 btw
+    max_seq_len: int = 128
     dropout: float = 0.1
     pad_token_id: int = 0
     bos_token_id: int = 1
@@ -126,9 +125,6 @@ class MiniDecoder(nn.Module):
             pos_output = self.pos_encoding(tok_output)
             drop_output = self.dropout(pos_output)
             rotary_freqs = None
-
-        # causal = build_causal_mask(drop_output.size(1), drop_output.device)
-        # padding = build_padding_mask(attention_mask)
 
         temp = drop_output
         for layer in self.layers:
